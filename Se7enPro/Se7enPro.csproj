@@ -42,6 +42,7 @@
   <ItemGroup>
     <Content Include="Resources\psiphon-tunnel-core.exe">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
     <None Include="Resources\server_entries.txt" Condition="Exists('Resources\server_entries.txt')">
       <CopyToOutputDirectory>Never</CopyToOutputDirectory>
@@ -52,43 +53,55 @@
 
     <Content Include="Resources\tun2socks\tun2socks.exe">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
     <Content Include="Resources\tun2socks\wintun.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
 
     <Content Include="Resources\aether\aether.exe">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
     <Content Include="Resources\aether\pt\lyrebird.exe">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
 
     <Content Include="Resources\tor\tor.exe">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
     <Content Include="Resources\tor\pluggable_transports\lyrebird.exe">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
     <Content Include="Resources\tor\pluggable_transports\conjure-client.exe">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
     <Content Include="Resources\tor\data\geoip">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
     <Content Include="Resources\tor\data\geoip6">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
 
     <Content Include="Resources\xray\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
     <Content Include="Resources\sing_box\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
 
     <Content Include="Resources\shard\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
 
     <EmbeddedResource Include="Resources\akamai_seed_ips.txt" />
@@ -100,5 +113,33 @@
   <ItemGroup>
     <Resource Include="Assets\**\*" />
   </ItemGroup>
+
+  <!--
+    The release package is assembled by copying this project's publish
+    folder next to the Flutter GUI, so every bundled helper binary has to
+    be present in $(PublishDir)\Resources. Leaving that to <Content> copy
+    semantics alone is fragile under self-contained single-file publish:
+    CI failed with "Package is incomplete, missing:
+    Resources\psiphon-tunnel-core.exe" even though the file is committed.
+    Copy the folder explicitly (source tree is the source of truth), with
+    retries, and print the count so a short copy is obvious in the log.
+  -->
+  <Target Name="CopySe7enResourcesToPublishDir" AfterTargets="Publish">
+    <ItemGroup>
+      <_Se7enResourceFile Include="$(MSBuildProjectDirectory)\Resources\**\*"
+                          Exclude="$(MSBuildProjectDirectory)\Resources\*.txt;
+                                   $(MSBuildProjectDirectory)\Resources\server_entries.*;
+                                   $(MSBuildProjectDirectory)\Resources\**\*.toml" />
+    </ItemGroup>
+
+    <Copy SourceFiles="@(_Se7enResourceFile)"
+          DestinationFiles="@(_Se7enResourceFile->'$(PublishDir)Resources\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Retries="3"
+          RetryDelayMilliseconds="500" />
+
+    <Message Importance="high"
+             Text="Se7en: staged @(_Se7enResourceFile->Count()) bundled resource files into $(PublishDir)Resources\" />
+  </Target>
 
 </Project>

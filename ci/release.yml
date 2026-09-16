@@ -1,0 +1,256 @@
+# =====================================================================
+#  Se7en Pro — Windows build & release pipeline
+#
+#  >>> ACTION REQUIRED: move this file to .github/workflows/release.yml
+#  It does nothing while it lives under ci/. Renaming it in the GitHub
+#  web editor (or `git mv ci/release.yml .github/workflows/release.yml`)
+#  is enough — no other change needed.
+#
+#  What it does:
+#    * on every `v*` tag  -> builds and attaches the downloadable .zip
+#                            (+ SHA256) to that GitHub Release
+#    * on push / PR to master -> builds and uploads the same package as a
+#                            workflow artifact, so a broken build is
+#                            caught before it reaches master
+#
+#  The package is one folder: Flutter GUI (Se7enPro.exe) + the .NET 8
+#  Se7enCore daemon side by side, because PipeCoreClient looks for
+#  Se7enCore.exe in its own directory. The bundled Resources (psiphon,
+#  tor, tun2socks, aether, xray, sing_box, shard) are copied into the
+#  package straight from the repo — see the "Assemble" step for why.
+# =====================================================================
+
+name: Windows Build & Release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and attach artifacts to (e.g. v1.0.5). Leave empty for a plain dev build.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+
+jobs:
+  build:
+    name: Build Se7en Pro (win-x64)
+    runs-on: windows-latest
+
+    steps:
+      # Defender on the hosted runner false-positives circumvention
+      # binaries (psiphon-tunnel-core, tor, tun2socks) and quietly removes
+      # the copies that land in staging\ and dist\, which used to surface
+      # much later as "Package is incomplete". Exclude the workspace
+      # before anything is written to it.
+      - name: Relax Defender for the build workspace
+        shell: pwsh
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath 'C:\a', 'D:\a', $env:RUNNER_TEMP -ErrorAction Stop
+            Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
+            Write-Host 'Defender exclusions applied.'
+          } catch {
+            Write-Host "Could not adjust Defender, continuing: $($_.Exception.Message)"
+          }
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+          lfs: true
+
+      - name: Resolve build metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = '${{ github.event.inputs.tag }}'
+          if ([string]::IsNullOrWhiteSpace($tag) -and ('${{ github.ref_type }}' -eq 'tag')) {
+            $tag = '${{ github.ref_name }}'
+          }
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $sha   = (git rev-parse --short HEAD).Trim()
+            $label = "dev-$sha"
+            $isRelease = 'false'
+          } else {
+            $label = $tag
+            $isRelease = 'true'
+          }
+          $pkg = "Se7enPro-$label-win-x64"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "is_release=$isRelease"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "package=$pkg"
+          Write-Host "Building '$pkg' (release upload: $isRelease)"
+
+      - name: Setup .NET SDK 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Enable Windows desktop target
+        shell: pwsh
+        run: |
+          flutter --version
+          flutter config --enable-windows-desktop
+
+      # --- 1. Se7enCore: headless .NET 8 daemon ----------------------------
+      # Self-contained single file so users don't need a .NET runtime.
+      - name: Build Se7enCore daemon
+        shell: pwsh
+        working-directory: Se7enPro
+        run: |
+          dotnet publish Se7enPro.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=none `
+            -p:SatelliteResourceLanguages=en `
+            -o "$env:GITHUB_WORKSPACE\staging\core"
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed ($LASTEXITCODE)" }
+
+      # --- 2. Se7enFlutter: the GUI ----------------------------------------
+      - name: Build Flutter client
+        shell: pwsh
+        working-directory: Se7enFlutter
+        run: |
+          flutter pub get
+          if ($LASTEXITCODE -ne 0) { throw "flutter pub get failed ($LASTEXITCODE)" }
+          flutter build windows --release
+          if ($LASTEXITCODE -ne 0) { throw "flutter build windows failed ($LASTEXITCODE)" }
+
+      # --- 3. Package both halves into one folder --------------------------
+      - name: Assemble release package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Sync-Dir($src, $dst) {
+            if (-not (Test-Path -LiteralPath $src)) { throw "Missing build output: $src" }
+            robocopy $src $dst /E /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed: $src -> $dst ($LASTEXITCODE)" }
+            $global:LASTEXITCODE = 0
+          }
+
+          $pkg = '${{ steps.meta.outputs.package }}'
+          $out = Join-Path 'dist' $pkg
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          Sync-Dir 'Se7enFlutter\build\windows\x64\runner\Release' $out
+          Sync-Dir 'staging\core' $out
+
+          # Resources come from the repo, not from the publish output.
+          # `dotnet publish` copying <Content> items is a side effect we do
+          # not control (single-file publish layout, AV interference), and
+          # when one of those copies goes missing the package silently ends
+          # up half-built. The source tree is the single source of truth.
+          $res = Join-Path $out 'Resources'
+          Sync-Dir 'Se7enPro\Resources' $res
+          if (Test-Path -LiteralPath 'Se7enFlutter\Resources') {
+            Sync-Dir 'Se7enFlutter\Resources' $res
+          }
+
+          Copy-Item 'LICENSE'   -Destination $out -Force
+          Copy-Item 'README.md' -Destination $out -Force
+
+          # Sanity gates: collect every problem, then fail once with the
+          # full picture instead of dying on the first missing file.
+          $required = @(
+            'Se7enPro.exe',
+            'Se7enCore.exe',
+            'data\flutter_assets',
+            'Resources\psiphon-tunnel-core.exe',
+            'Resources\tun2socks\tun2socks.exe',
+            'Resources\tun2socks\wintun.dll',
+            'Resources\tor\tor.exe',
+            'Resources\aether\aether.exe'
+          )
+
+          # A binary that is far too small is a Git LFS pointer or an AV
+          # stub, which is just as broken as a missing file.
+          $minBytes = [ordered]@{
+            'Resources\psiphon-tunnel-core.exe' = 1MB
+            'Resources\tun2socks\tun2socks.exe' = 1MB
+            'Resources\tor\tor.exe'             = 1MB
+            'Resources\aether\aether.exe'       = 1MB
+            'Resources\tun2socks\wintun.dll'    = 100KB
+          }
+
+          $problems = @()
+          foreach ($item in $required) {
+            $path = Join-Path $out $item
+            if (-not (Test-Path -LiteralPath $path)) {
+              $problems += "missing: $item"
+              continue
+            }
+            if ($minBytes.Contains($item)) {
+              $size = (Get-Item -LiteralPath $path).Length
+              if ($size -lt $minBytes[$item]) {
+                $problems += "truncated: $item ($size bytes)"
+              }
+            }
+          }
+
+          if ($problems.Count -gt 0) {
+            Write-Host '--- package contents ---'
+            $root = (Resolve-Path -LiteralPath $out).Path
+            Get-ChildItem -LiteralPath $out -Recurse -File |
+              ForEach-Object { $_.FullName.Substring($root.Length + 1) } |
+              Sort-Object |
+              Write-Host
+            Write-Host '--- end package contents ---'
+            throw "Package is incomplete -> $($problems -join '; ')"
+          }
+
+          $zip = "dist\$pkg.zip"
+          Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          "$hash  $pkg.zip" | Out-File -FilePath "$zip.sha256" -Encoding ascii
+          Write-Host "Packaged $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB)"
+          Write-Host "SHA256: $hash"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.package }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      # --- 4. Attach the download to the GitHub Release --------------------
+      - name: Attach artifacts to release
+        if: steps.meta.outputs.is_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

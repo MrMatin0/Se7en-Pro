@@ -61,6 +61,9 @@ enum LogEngineFilter {
   final IconData icon;
   final List<String> keywords;
 
+  /// Compiled once per enum value rather than per matched line.
+  static final RegExp _torWord = RegExp(r'\btor\b');
+
   bool matches(String line) {
     if (this == LogEngineFilter.all) return true;
     final lower = line.toLowerCase();
@@ -89,8 +92,7 @@ enum LogEngineFilter {
     if (this == LogEngineFilter.tor) {
       if (hasTorTag) return true;
       if (hasPsiphonTag || hasTunTag || hasWarpTag || hasV2rayTag || hasUltraTag || hasShardTag) return false;
-      final torWordMatch = RegExp(r'\btor\b').hasMatch(lower);
-      return torWordMatch ||
+      return _torWord.hasMatch(lower) ||
           lower.contains('onion') ||
           lower.contains('snowflake') ||
           lower.contains('obfs4') ||
@@ -169,14 +171,20 @@ class LogsPage extends ConsumerStatefulWidget {
 
 class _LogsPageState extends ConsumerState<LogsPage> {
   static const int _maxHistory = 1200;
+  static const Duration _flushWindow = Duration(milliseconds: 200);
+
   final _lines = <String>[];
   final _pendingLines = <String>[];
-  Timer? _batchTimer;
+  Timer? _flushTimer;
   final _scroll = ScrollController();
   StreamSubscription<String>? _sub;
   bool _autoScroll = true;
   String _filter = '';
   LogEngineFilter _engineFilter = LogEngineFilter.all;
+
+  /// Matching a 1200-line buffer is far too expensive to redo on every frame,
+  /// so the result is kept until something that affects it actually changes.
+  List<String>? _visibleCache;
 
   @override
   void initState() {
@@ -189,16 +197,29 @@ class _LogsPageState extends ConsumerState<LogsPage> {
       _lines.addAll(initial);
     }
 
-    _batchTimer = Timer.periodic(const Duration(milliseconds: 120), (_) => _flushPendingLogs());
-
+    // No periodic timer: one is scheduled on demand when a line arrives and
+    // disposed as soon as it fires, so an idle log stream costs nothing.
     _sub = core.logStream.listen((line) {
       _pendingLines.add(line);
+      _flushTimer ??= Timer(_flushWindow, _flushPendingLogs);
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) => _jumpToEnd());
   }
 
+  bool _matches(String line) {
+    if (!_engineFilter.matches(line)) return false;
+    final f = _filter;
+    if (f.isNotEmpty && !line.toLowerCase().contains(f)) return false;
+    return true;
+  }
+
+  List<String> get _visible => _visibleCache ??= _lines.where(_matches).toList();
+
+  void _invalidateVisible() => _visibleCache = null;
+
   void _flushPendingLogs() {
+    _flushTimer = null;
     if (!mounted || _pendingLines.isEmpty) return;
     final toAdd = List<String>.from(_pendingLines);
     _pendingLines.clear();
@@ -207,6 +228,13 @@ class _LogsPageState extends ConsumerState<LogsPage> {
       _lines.addAll(toAdd);
       if (_lines.length > _maxHistory) {
         _lines.removeRange(0, _lines.length - _maxHistory);
+        // The window slid, so the cached head is no longer valid.
+        _invalidateVisible();
+      } else if (_visibleCache != null) {
+        // Otherwise only the new lines need matching.
+        for (final line in toAdd) {
+          if (_matches(line)) _visibleCache!.add(line);
+        }
       }
     });
     _maybeAutoScroll();
@@ -214,7 +242,7 @@ class _LogsPageState extends ConsumerState<LogsPage> {
 
   @override
   void dispose() {
-    _batchTimer?.cancel();
+    _flushTimer?.cancel();
     _sub?.cancel();
     _scroll.dispose();
     super.dispose();
@@ -235,6 +263,7 @@ class _LogsPageState extends ConsumerState<LogsPage> {
     setState(() {
       _lines.clear();
       _pendingLines.clear();
+      _invalidateVisible();
     });
     ref.read(coreClientProvider).clearRecentLog();
   }
@@ -243,19 +272,13 @@ class _LogsPageState extends ConsumerState<LogsPage> {
   Widget build(BuildContext context) {
     final c = Theme.of(context).extension<AppColors>()!;
     final str = ref.watch(stringsProvider);
-    final f = _filter.trim().toLowerCase();
-    final visible = _lines.where((l) {
-      if (!_engineFilter.matches(l)) return false;
-      if (f.isNotEmpty && !l.toLowerCase().contains(f)) return false;
-      return true;
-    }).toList();
+    final visible = _visible;
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(24, 6, 24, 20),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-
           _ModernLogToolbar(
             str: str,
             count: visible.length,
@@ -265,18 +288,26 @@ class _LogsPageState extends ConsumerState<LogsPage> {
               setState(() => _autoScroll = v);
               if (v) _maybeAutoScroll();
             },
-            onEngineFilterChanged: (eng) => setState(() => _engineFilter = eng),
-            onFilter: (v) => setState(() => _filter = v),
-            onCopy: () => Clipboard.setData(ClipboardData(text: visible.join('\n'))),
+            onEngineFilterChanged: (eng) => setState(() {
+              _engineFilter = eng;
+              _invalidateVisible();
+            }),
+            onFilter: (v) => setState(() {
+              _filter = v.trim().toLowerCase();
+              _invalidateVisible();
+            }),
+            onCopy: () =>
+                Clipboard.setData(ClipboardData(text: visible.join('\n'))),
             onClear: _clearLogs,
           ),
           const SizedBox(height: 12),
-
           Expanded(
             child: GlassCard(
               padding: const EdgeInsets.all(4),
               borderRadius: 14,
-              fillColor: c.isDark ? const Color(0xFF090D16) : const Color(0xFFF1F5F9),
+              fillColor: c.isDark
+                  ? const Color(0xFF090D16)
+                  : const Color(0xFFF1F5F9),
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(10),
                 child: visible.isEmpty
@@ -291,9 +322,11 @@ class _LogsPageState extends ConsumerState<LogsPage> {
                           controller: _scroll,
                           child: ListView.builder(
                             controller: _scroll,
-                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 14, vertical: 10),
                             itemCount: visible.length,
-                            itemBuilder: (context, i) => _ModernLogEntry(text: visible[i]),
+                            itemBuilder: (context, i) =>
+                                _ModernLogEntry(text: visible[i]),
                           ),
                         ),
                       ),

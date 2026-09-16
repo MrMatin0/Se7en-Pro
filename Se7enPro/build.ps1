@@ -14,10 +14,10 @@ try {
             -p:PublishSingleFile=true `
             -p:IncludeNativeLibrariesForSelfExtract=true `
             -p:EnableCompressionInSingleFile=true
-        $exe = Join-Path $projectDir 'bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\Se7enPro.exe'
+        $exe = Join-Path $projectDir 'bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\Se7enCore.exe'
     } else {
         dotnet build -c Release -r win-x64 --self-contained false
-        $exe = Join-Path $projectDir 'bin\Release\net8.0-windows10.0.19041.0\win-x64\Se7enPro.exe'
+        $exe = Join-Path $projectDir 'bin\Release\net8.0-windows10.0.19041.0\win-x64\Se7enCore.exe'
     }
 
     if ($LASTEXITCODE -ne 0) {

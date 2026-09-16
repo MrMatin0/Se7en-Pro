@@ -40,9 +40,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="Resources\psiphon-tunnel-core.exe">
+    <Content Include="Resources\psiphon-tunnel-core.exe">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
+    </Content>
     <None Include="Resources\server_entries.txt" Condition="Exists('Resources\server_entries.txt')">
       <CopyToOutputDirectory>Never</CopyToOutputDirectory>
     </None>

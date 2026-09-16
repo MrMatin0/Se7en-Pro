@@ -25,6 +25,15 @@ class AppShell extends ConsumerStatefulWidget {
 class _AppShellState extends ConsumerState<AppShell> with WindowListener {
   bool _isMaximized = false;
   bool _isMinimized = false;
+  bool _hasFocus = true;
+
+  /// Pages are heavy (settings alone is thousands of widgets). Only build one
+  /// once the user actually opens it, then keep it alive so its state survives
+  /// tab switches.
+  final Set<int> _visited = {0};
+
+  /// True when no frame we produce could possibly be seen.
+  bool get _offscreen => _isMinimized || !_hasFocus;
 
   @override
   void initState() {
@@ -69,6 +78,16 @@ class _AppShellState extends ConsumerState<AppShell> with WindowListener {
   }
 
   @override
+  void onWindowFocus() {
+    if (!_hasFocus) setState(() => _hasFocus = true);
+  }
+
+  @override
+  void onWindowBlur() {
+    if (_hasFocus) setState(() => _hasFocus = false);
+  }
+
+  @override
   void onWindowClose() async {
     final isPreventClose = await windowManager.isPreventClose();
     if (isPreventClose && mounted) {
@@ -85,13 +104,22 @@ class _AppShellState extends ConsumerState<AppShell> with WindowListener {
     } catch (_) {}
   }
 
-  static const _pages = <Widget>[
-    HomePage(),
-    SplitTunnelPage(),
-    LogsPage(),
-    SettingsPage(),
-    AboutPage(),
-  ];
+  Widget _pageAt(int i) {
+    switch (i) {
+      case 0:
+        return const HomePage();
+      case 1:
+        return const SplitTunnelPage();
+      case 2:
+        return const LogsPage();
+      case 3:
+        return const SettingsPage();
+      default:
+        return const AboutPage();
+    }
+  }
+
+  static const int _pageCount = 5;
 
   @override
   Widget build(BuildContext context) {
@@ -115,6 +143,7 @@ class _AppShellState extends ConsumerState<AppShell> with WindowListener {
     ];
 
     final index = ref.watch(currentNavIndexProvider);
+    _visited.add(index);
 
     return Directionality(
       textDirection: TextDirection.ltr,
@@ -131,7 +160,8 @@ class _AppShellState extends ConsumerState<AppShell> with WindowListener {
                     AppSidebar(
                       destinations: destinations,
                       selectedIndex: index,
-                      onSelect: (i) => ref.read(currentNavIndexProvider.notifier).state = i,
+                      onSelect: (i) =>
+                          ref.read(currentNavIndexProvider.notifier).state = i,
                     ),
                     Expanded(
                       child: Container(
@@ -144,11 +174,14 @@ class _AppShellState extends ConsumerState<AppShell> with WindowListener {
                               child: IndexedStack(
                                 index: index,
                                 children: [
-                                  for (int i = 0; i < _pages.length; i++)
-                                    TickerMode(
-                                      enabled: !_isMinimized && index == i,
-                                      child: _pages[i],
-                                    ),
+                                  for (int i = 0; i < _pageCount; i++)
+                                    if (_visited.contains(i))
+                                      TickerMode(
+                                        enabled: !_offscreen && index == i,
+                                        child: _pageAt(i),
+                                      )
+                                    else
+                                      const SizedBox.shrink(),
                                 ],
                               ),
                             ),
@@ -190,7 +223,6 @@ class _ModernHeader extends StatelessWidget {
             ),
           ),
           const Spacer(),
-
           const _QuickThemeToggleBtn(),
         ],
       ),
@@ -202,7 +234,8 @@ class _QuickThemeToggleBtn extends ConsumerStatefulWidget {
   const _QuickThemeToggleBtn();
 
   @override
-  ConsumerState<_QuickThemeToggleBtn> createState() => _QuickThemeToggleBtnState();
+  ConsumerState<_QuickThemeToggleBtn> createState() =>
+      _QuickThemeToggleBtnState();
 }
 
 class _QuickThemeToggleBtnState extends ConsumerState<_QuickThemeToggleBtn> {
@@ -232,18 +265,11 @@ class _QuickThemeToggleBtnState extends ConsumerState<_QuickThemeToggleBtn> {
               borderRadius: BorderRadius.circular(9),
               border: Border.all(
                 color: _hovered
-                    ? (isDark ? BrandColors.warning.withValues(alpha: 0.6) : BrandColors.primary.withValues(alpha: 0.6))
+                    ? (isDark
+                        ? BrandColors.warning.withValues(alpha: 0.6)
+                        : BrandColors.primary.withValues(alpha: 0.6))
                     : c.border.withValues(alpha: 0.6),
               ),
-              boxShadow: _hovered
-                  ? [
-                      BoxShadow(
-                        color: (isDark ? BrandColors.warning : BrandColors.primary).withValues(alpha: 0.2),
-                        blurRadius: 8,
-                        offset: const Offset(0, 1),
-                      ),
-                    ]
-                  : null,
             ),
             child: Icon(
               isDark ? Icons.light_mode_rounded : Icons.dark_mode_rounded,
